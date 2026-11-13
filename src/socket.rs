@@ -318,44 +318,66 @@ impl Socket {
             .wait_for_link_with_cancellation(token)
             .await?;
 
+        // Waking does not prove connection completion: polls can be spurious.
+        // Start once, then inspect readiness and the asynchronous socket error.
+        let mut started = false;
         core::future::poll_fn(|cx| {
-            #[cfg(feature = "defmt")]
-            defmt::trace!("Connecting socket {}", self.fd);
-
             if token.is_cancelled() {
                 return Poll::Ready(Err(Error::OperationCancelled));
             }
-
-            // Cast the address to something the nrf-modem understands
-            let address = NrfSockAddr::from(address);
-
             register_socket_waker(cx.waker().clone(), self.fd, SocketDirection::Either);
-
-            // Do the connect call, this is non-blocking due to the socket setup
-            let mut connect_result = unsafe {
-                nrfxlib_sys::nrf_connect(self.fd, address.as_ptr(), address.size() as u32)
-            } as isize;
-
-            const NRF_EINPROGRESS: isize = nrfxlib_sys::NRF_EINPROGRESS as isize;
-            const NRF_EALREADY: isize = nrfxlib_sys::NRF_EALREADY as isize;
-            const NRF_EISCONN: isize = nrfxlib_sys::NRF_EISCONN as isize;
-
-            if connect_result == -1 {
-                connect_result = get_last_error();
+            if !started {
+                started = true;
+                let address = NrfSockAddr::from(address);
+                let result = unsafe {
+                    nrfxlib_sys::nrf_connect(self.fd, address.as_ptr(), address.size() as u32)
+                };
+                let error = get_last_error();
+                return match (result, error as u32) {
+                    (0, _) => Poll::Ready(Ok(())),
+                    (-1, nrfxlib_sys::NRF_EINPROGRESS | nrfxlib_sys::NRF_EALREADY) => Poll::Pending,
+                    (-1, nrfxlib_sys::NRF_EISCONN) => Poll::Ready(Ok(())),
+                    _ => Poll::Ready(Err(Error::NrfError(error))),
+                };
             }
-
-            #[cfg(feature = "defmt")]
-            defmt::trace!("Connect result {}", connect_result);
-
-            match connect_result {
-                // 0 when we have succesfully connected
-                0 => Poll::Ready(Ok(())),
-                // The socket was already connected
-                NRF_EISCONN => Poll::Ready(Ok(())),
-                // The socket is not yet connected
-                NRF_EINPROGRESS | NRF_EALREADY => Poll::Pending,
-                // Something else, this is likely an error
-                error => Poll::Ready(Err(Error::NrfError(error))),
+            let mut fd = nrfxlib_sys::nrf_pollfd {
+                fd: self.fd,
+                events: nrfxlib_sys::NRF_POLLOUT as i16,
+                revents: 0,
+            };
+            let result = unsafe { nrfxlib_sys::nrf_poll(&mut fd, 1, 0) };
+            if result < 0 {
+                return Poll::Ready(Err(Error::NrfError(get_last_error())));
+            }
+            if result == 0 {
+                return Poll::Pending;
+            }
+            let mut error: i32 = 0;
+            let mut length: u32 = core::mem::size_of::<i32>() as u32;
+            let result = unsafe {
+                nrfxlib_sys::nrf_getsockopt(
+                    self.fd,
+                    nrfxlib_sys::NRF_SOL_SOCKET as i32,
+                    nrfxlib_sys::NRF_SO_ERROR as i32,
+                    &mut error as *mut _ as *mut _,
+                    &mut length,
+                )
+            };
+            if result < 0 {
+                return Poll::Ready(Err(Error::NrfError(get_last_error())));
+            }
+            if error != 0 {
+                return Poll::Ready(Err(Error::NrfError(error as isize)));
+            }
+            let terminal =
+                nrfxlib_sys::NRF_POLLERR | nrfxlib_sys::NRF_POLLHUP | nrfxlib_sys::NRF_POLLNVAL;
+            if fd.revents as u32 & terminal != 0 {
+                return Poll::Ready(Err(Error::Disconnected));
+            }
+            if fd.revents as u32 & nrfxlib_sys::NRF_POLLOUT != 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(Error::Disconnected))
             }
         })
         .await?;
